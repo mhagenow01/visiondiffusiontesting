@@ -1,4 +1,4 @@
-from policies.base_policy import Policy  # LLMVISIONUPDATE: policy will now include image conditioning
+from base_policy import Policy  # LLMVISIONUPDATE: policy will now include image conditioning
 import numpy as np
 from tqdm.auto import tqdm
 import pickle
@@ -16,43 +16,87 @@ from diffusers.optimization import get_scheduler
 import collections
 
 # LLMVISIONUPDATE: import DINOv2 encoder and transforms for image processing
-from torchmodels import dinov2_base
+from transformers import AutoModel, AutoImageProcessor
+
 import torchvision.transforms as T
+
+from PIL import Image
 
 # Credit -- Diffusion related work based on 
 # https://github.com/real-stanford/diffusion_policy
 
 ########## Diffusion Data Processing Helper Functions #########
 
+
+import torch
+import numpy as np
+from transformers import AutoModel, AutoImageProcessor
+from torchvision import transforms as T
+from PIL import Image
+import pickle
+import os
+
+def precompute_dino_feats(images_arr: np.ndarray, batch_size=32, device='cuda'):
+    """
+    images_arr: np.ndarray of shape (T, H, W, C)
+    Returns: np.ndarray of shape (T, feat_dim)
+    """
+    assert images_arr.ndim == 4 and images_arr.shape[-1] == 3, "Expected (T, H, W, 3) array"
+
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+    model = AutoModel.from_pretrained("facebook/dinov2-base").to(device).eval()
+
+    transform = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std =[0.229, 0.224, 0.225])
+    ])
+
+    # Preprocess all images
+    tensors = [
+        transform(Image.fromarray(img).convert("RGB"))
+        for img in images_arr
+    ]
+    imgs_tensor = torch.stack(tensors, dim=0)  # (T, 3, 224, 224)
+
+    feats = []
+    with torch.no_grad():
+        for i in range(0, imgs_tensor.shape[0], batch_size):
+            batch = imgs_tensor[i:i+batch_size].to(device)
+            output = model(batch).pooler_output.cpu()
+            feats.append(output)
+
+    return torch.cat(feats, dim=0).numpy()  # shape (T, feat_dim)
+
+
 class TrajectoryDatasetDiffusion(Dataset):
-    def __init__(self, states, actions, images, pred_horizon, obs_horizon, action_horizon):
-        # LLMVISIONUPDATE: dataset now takes aligned `images` list
-        # states are list of nxT, actions are list of mxT, images are list of HxWxC x T where each list item is an episode
+    def __init__(self, states, actions, image_feats, pred_horizon, obs_horizon, action_horizon):
+        # LLMVISIONUPDATE: using precomputed image features
         num_episodes = len(states)
         obs_dim = np.shape(states[0])[0]
         action_dim = np.shape(actions[0])[0]
+        feat_dim = np.shape(image_feats[0])[1]  # assume (T_i, feat_dim)
 
         self.num_samples = 0
         self.states_flat = np.zeros((0, obs_dim))
         self.actions_flat = np.zeros((0, action_dim))
-        self.images_flat = []  # list to hold raw images
+        self.image_feats_flat = np.zeros((0, feat_dim))
         self.ends = []
 
-        # LLMVISIONUPDATE: flatten states, actions, and images across episodes
         for ii in range(num_episodes):
             T_i = np.shape(states[ii])[1]
             self.num_samples += T_i
             self.states_flat = np.concatenate((self.states_flat, states[ii].T), axis=0)
             self.actions_flat = np.concatenate((self.actions_flat, actions[ii].T), axis=0)
-            # assume images[ii] is array of shape (T_i, H, W, C)
-            self.images_flat.extend(list(images[ii]))
+            self.image_feats_flat = np.concatenate((self.image_feats_flat, image_feats[ii]), axis=0)
             self.ends.append(self.num_samples)
 
         train_data = {
             'action': self.actions_flat,
             'obs': self.states_flat
-            # LLMVISIONUPDATE: raw images are stored separately in self.images_flat
         }
+
         episode_ends = np.array(self.ends)
 
         indices = create_sample_indices(
@@ -67,20 +111,10 @@ class TrajectoryDatasetDiffusion(Dataset):
             stats[key] = get_data_stats(data)
             normalized_train_data[key] = normalize_data(data, stats[key])
 
-        # LLMVISIONUPDATE: initialize DINOv2 encoder and transform
-        self.device = torch.device('cuda')
-        self.image_encoder = dinov2_base(pretrained=True).to(self.device)
-        self.image_encoder.eval()
-        self.transform = T.Compose([
-            T.Resize((224, 224)),                              # scale to DINOv2’s expected size
-            T.ToTensor(),                                      # convert H×W×C uint8 → [0,1] float
-            T.Normalize(mean=[0.485, 0.456, 0.406],             # ImageNet-style normalization
-                        std =[0.229, 0.224, 0.225]),
-        ])
-
         self.indices = indices
         self.stats = stats
         self.normalized_train_data = normalized_train_data
+        self.image_feats_flat = torch.from_numpy(self.image_feats_flat).float()
         self.pred_horizon = pred_horizon
         self.action_horizon = action_horizon
         self.obs_horizon = obs_horizon
@@ -101,18 +135,12 @@ class TrajectoryDatasetDiffusion(Dataset):
         )
         nsample['obs'] = nsample['obs'][:self.obs_horizon, :]
 
-        # LLMVISIONUPDATE: process raw images for this window through DINOv2
-        raw_imgs = self.images_flat[buffer_start_idx:buffer_end_idx]
-        # convert raw images to tensor batch
-        img_tensors = torch.stack([self.transform(img) for img in raw_imgs], dim=0)  # (seq_len, C, H, W)
-        with torch.no_grad():
-            # encode each image to feature vector
-            img_feats = self.image_encoder(img_tensors)  # (seq_len, feat_dim)
-        # take features of last obs image as global image conditioning
-        img_feat = img_feats[self.obs_horizon - 1]  # (feat_dim,)
-        nsample['image_feat'] = img_feat
+        # LLMVISIONUPDATE: use precomputed image feature at obs_horizon-1
+        feats_window = self.image_feats_flat[buffer_start_idx:buffer_end_idx]
+        nsample['image_feat'] = feats_window[self.obs_horizon - 1].float()
 
         return nsample
+
 
 def sample_sequence(train_data, sequence_length,
                     buffer_start_idx, buffer_end_idx,
@@ -436,6 +464,9 @@ class VisionDiffusion(Policy):
         self.estimate_horizon = estimate_horizon
         self.diffusion_iterations = diffusion_iterations
 
+        self.device = torch.device('cuda')
+
+
         # LLMVISIONUPDATE: add image deque for inference
         self.obs_deque = None
         self.image_deque = None
@@ -446,7 +477,7 @@ class VisionDiffusion(Policy):
         dataset = TrajectoryDatasetDiffusion(
             states=states,
             actions=actions,
-            images=images,
+            image_feats=images,
             pred_horizon=self.pred_horizon,
             obs_horizon=self.obs_horizon,
             action_horizon=self.action_horizon
@@ -467,8 +498,10 @@ class VisionDiffusion(Policy):
         obs_dim = np.shape(states[0])[0]
         action_dim = np.shape(actions[0])[0]
         # LLMVISIONUPDATE: determine image feature dimension
-        dummy_img = torch.zeros((1, 3, 224, 224))
-        feat_dim = dinov2_base(pretrained=False)(dummy_img).shape[-1]
+        dummy_img = torch.zeros((1, 3, 224, 224)).to(self.device)
+        dinov2_base = AutoModel.from_pretrained("facebook/dinov2-base").to(self.device)
+
+        feat_dim = dinov2_base(dummy_img).pooler_output.shape[-1]
 
         # LLMVISIONUPDATE: include image features in global conditioning dimension
         total_cond_dim = obs_dim * self.obs_horizon + feat_dim
@@ -507,10 +540,10 @@ class VisionDiffusion(Policy):
         for epoch_idx in range(self.num_epochs):
             epoch_loss = []
             for nbatch in dataloader:
-                nobs = nbatch['obs'].to(device)
-                naction = nbatch['action'].to(device)
+                nobs = nbatch['obs'].to(device).float()
+                naction = nbatch['action'].to(device).float()
                 # LLMVISIONUPDATE: get image feature batch
-                img_feat = nbatch['image_feat'].to(device)
+                img_feat = nbatch['image_feat'].to(device).float()
 
                 B = nobs.shape[0]
                 obs_cond = nobs[:, :self.obs_horizon, :].flatten(start_dim=1)
@@ -610,6 +643,7 @@ class VisionDiffusion(Policy):
             self.noise_scheduler.set_timesteps(self.diffusion_iterations)
         self.obs_deque.append(state)
         self.image_deque.append(image)
+
 
         obs_seq = np.stack(self.obs_deque)
         nobs = normalize_data(obs_seq, stats=self.dataset.stats['obs'])

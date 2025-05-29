@@ -9,12 +9,6 @@ find_package(catkin REQUIRED COMPONENTS roscpp rospy roslib tf2_ros geometry_msg
 
 catkin_python_setup()
 
-generate_messages(
-  DEPENDENCIES
-  std_msgs
-  geometry_msgs
-)
-
 catkin_package(
   CATKIN_DEPENDS message_runtime
 )
