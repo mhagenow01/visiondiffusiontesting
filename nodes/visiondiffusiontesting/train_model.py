@@ -44,18 +44,15 @@ if __name__ == '__main__':
     states, actions, images = load_episode_dataset_no_encode(dir_path=project_path+'../../data/', pattern="tapping_6-6*.pkl")
 
     params = {
-            'save_location': project_path+'../../policies/visiondiffusionresnet_distory_ur5e_6-10_obs_hor_2_pred_32.pkl',
+            'save_location': project_path+'../../policies/visiondiffusion_6-10_obs_hor_2_pred_32.pkl',
             'save_epoch_freq': 1000,
             'distort': True,
-            'num_epochs': 8000,
+            'num_epochs': 2,
             'obs_horizon': 2,
             'pred_horizon' : 32,
             'action_horizon' : 4,
-            'estimate_horizon ' : 16,
             'vision_model_name': 'none',
         }
-
-    # TODO: get rid of estimate horizon (this was for REALM)
     
     policy = VisionDiffusionUNet(params)
     policy.train(states, actions, images, params.savelocation, save_epoch_freq=params.save_epoch_freq, distort=True)

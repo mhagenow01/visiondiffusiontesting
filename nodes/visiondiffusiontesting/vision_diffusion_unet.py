@@ -424,7 +424,6 @@ class VisionDiffusionUNet(Policy):
         self.obs_horizon = params.obs_horizon
         self.pred_horizon = params.pred_horizon
         self.action_horizon = params.action_horizon
-        self.estimate_horizon = params.estimate_horizon
         self.diffusion_iterations = params.diffusion_iterations
 
         self.device = torch.device('cuda')
