@@ -18,6 +18,8 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.optimization import get_scheduler
 import collections
 
+from scipy.spatial.transform import Rotation as R
+
 from vision_encoding import getVisionModel
 
 # Credit -- Diffusion related work based on 
@@ -98,6 +100,26 @@ class TrajectoryDatasetDiffusion(Dataset):
             sample_end_idx=sample_end_idx
         )
         nsample['obs'] = nsample['obs'][:self.obs_horizon, :]
+
+
+        ######
+        # All actions are relative from the current state
+
+        action = nsample['action']  # (T, D)
+        pos_dim = action.shape[1] - 4
+        pos = action[:, :pos_dim]
+        quat = action[:, pos_dim:]  # [x, y, z, w]
+
+        # Compute relative position
+        pos0 = pos[0]
+        pos_rel = pos - pos0
+
+        # Compute relative quaternion: q_rel = q * q0.inv()
+        r_all = R.from_quat(quat)
+        r0 = r_all[0]
+        quat_rel = (r_all * r0.inv()).as_quat()
+
+        nsample['action'] = np.concatenate([pos_rel, quat_rel], axis=1)
 
         # LLMVISIONUPDATE: use precomputed image feature at obs_horizon-1
         feats_window = self.image_feats_flat[buffer_start_idx:buffer_end_idx]
@@ -432,6 +454,8 @@ class VisionDiffusionUNet(Policy):
         self.vision_model = getVisionModel(modelname = self.vision_model_name)
         self.vision_model.to(self.device).eval()
 
+        self.lr_scheduler = None
+
         # LLMVISIONUPDATE: add image deque for inference
         self.obs_deque = None
         self.image_deque = None
@@ -496,7 +520,7 @@ class VisionDiffusionUNet(Policy):
             dataset, dataloader = self.setupData(states, actions, images)
 
             # Cosine LR schedule with linear warmup
-            lr_scheduler = get_scheduler(
+            self.lr_scheduler = get_scheduler(
                 name='cosine',
                 optimizer=optimizer,
                 num_warmup_steps=500,
@@ -528,12 +552,13 @@ class VisionDiffusionUNet(Policy):
             if distort:
                 dataset, dataloader = self.setupData(states, actions, images,distort=True)
                 # Cosine LR schedule with linear warmup
-                lr_scheduler = get_scheduler(
-                    name='cosine',
-                    optimizer=optimizer,
-                    num_warmup_steps=500,
-                    num_training_steps=len(dataloader) * self.num_epochs
-                )
+                if self.lr_scheduler is None:
+                    self.lr_scheduler = get_scheduler(
+                        name='cosine',
+                        optimizer=optimizer,
+                        num_warmup_steps=500,
+                        num_training_steps=len(dataloader) * self.num_epochs
+                    )
             for nbatch in dataloader:
                 nobs = nbatch['obs'].to(device).float()
                 naction = nbatch['action'].to(device).float()
@@ -555,12 +580,12 @@ class VisionDiffusionUNet(Policy):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                lr_scheduler.step()
+                self.lr_scheduler.step()
                 ema.step(noise_pred_net.parameters())
 
                 epoch_loss.append(loss.item())
 
-            if epoch_idx%save_epoch_freq==0 and epoch_idx>0:
+            if save_epoch_freq is not None and epoch_idx%save_epoch_freq==0 and epoch_idx>0:
                 self.inference_model = copy.deepcopy(noise_pred_net)
                 ema.copy_to(self.inference_model.parameters())
                 self.dataset = dataset
@@ -643,7 +668,6 @@ class VisionDiffusionUNet(Policy):
             self.image_deque = collections.deque([image] * self.obs_horizon, maxlen=self.obs_horizon)
             self.noise_scheduler.set_timesteps(self.diffusion_iterations)
         self.obs_deque.append(state)
-        print(type(image))
         self.image_deque.append(image)
 
         obs_seq = np.stack(self.obs_deque)
@@ -666,7 +690,23 @@ class VisionDiffusionUNet(Policy):
             noisy_action = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=noisy_action).prev_sample
 
         naction = noisy_action.cpu().detach().numpy()[0]
-        generated = unnormalize_data(naction, stats=self.dataset.stats['action'])
+        action_rel = unnormalize_data(naction, stats=self.dataset.stats['action'])
+
+        pos_dim = action_rel.shape[1] - 4
+        pos_rel = action_rel[:, :pos_dim]
+        quat_rel = action_rel[:, pos_dim:]
+
+        # Recover absolute positions
+        pos_abs = np.cumsum(pos_rel, axis=0)
+
+        # Recover absolute quaternions via composition: q = q_rel · q₀
+        q0 = R.from_quat(state[3:7])
+        q_rel_seq = R.from_quat(quat_rel)
+        quat_abs = (q_rel_seq * q0).as_quat()
+
+        generated = np.concatenate([pos_abs, quat_abs], axis=1)
+
+
         return generated if forecast else generated[0]
 
     def forecastAction(self, state, image, num_seeds, length):
@@ -693,9 +733,8 @@ class VisionDiffusionUNet(Policy):
         obs_cond = nobs.unsqueeze(0).flatten(start_dim=1)
 
         raw_img = self.image_deque[-1]
-        img_tensor = self.dataset.transform(raw_img).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            img_feat = self.dataset.image_encoder(img_tensor).squeeze(0)
+        img_feat = self.vision_model.encode([raw_img],1,self.device)
+        img_feat = torch.from_numpy(img_feat).float().to(self.device).squeeze(0)
 
         # replicate conditioning for batch
         cond_state = obs_cond.repeat(num_samples, 1)
@@ -708,7 +747,21 @@ class VisionDiffusionUNet(Policy):
             noisy_actions = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=noisy_actions).prev_sample
 
         naction = noisy_actions.cpu().numpy()
-        generated = unnormalize_data(naction, stats=self.dataset.stats['action'])
+        action_rel = unnormalize_data(naction, stats=self.dataset.stats['action'])
+
+        pos_dim = action_rel.shape[2] - 4
+        pos_rel = action_rel[:, :, :pos_dim]
+        quat_rel = action_rel[:, :, pos_dim:]
+
+        # Recover positions
+        pos_abs = np.cumsum(pos_rel, axis=1)
+
+        # Recover quaternions
+        q0 = R.from_quat(state[3:7]) # pos, orientation are the start of state
+        quat_abs = np.stack([(R.from_quat(qrel) * q0).as_quat() for qrel in quat_rel], axis=0)
+
+        generated = np.concatenate([pos_abs, quat_abs], axis=2)
+
         if length < generated.shape[1]:
             return generated[:, :length, :]
         return generated
