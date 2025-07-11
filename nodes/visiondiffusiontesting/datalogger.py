@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import os
 import sys
 import threading
@@ -13,6 +14,11 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
+from robotreset import gotoPose
+
+from scipy.spatial.transform import Rotation as ScipyR
+
+
 class DataLogger:
     def __init__(self, freq_hz=5.0):
         self.recording = False
@@ -21,8 +27,13 @@ class DataLogger:
         self.current_pose = None
         self.current_image = None
 
+        # for homing
+        self.home_pos = np.array([0.275, -0.343, 0.293])
+        self.home_quat = [0.10318,0.0925,0.7008,-0.6997] #xyzw
+        self.home_quat_R = ScipyR.from_quat(self.home_quat)
+
         self.bridge = CvBridge()
-        rospy.Subscriber('/ur5e/compliant_pose', PoseStamped, self._pose_cb)
+        rospy.Subscriber('/ur5e/current_pose', PoseStamped, self._pose_cb)
         rospy.Subscriber('/robot_webcam/image_raw', Image,        self._img_cb)
 
         # timer for fixed-rate sampling
@@ -72,6 +83,18 @@ class DataLogger:
                     c = sys.stdin.read(1)
                     if c.lower() == 'r':
                         self._toggle_recording()
+                    if c.lower() == 'p':
+                        # pos = np.array([0.275, -0.343, 0.293])
+                        # quat = [0.10318,0.0925,0.7008,-0.6997] #xyzw
+                        # quat_R = ScipyR.from_quat(quat)
+                        rand_rot = ScipyR.from_rotvec(np.random.normal(0,0.015,3))
+                        new_quat = (self.home_quat_R*rand_rot).as_quat()
+                        pos_noise = np.random.normal(0,0.003,3)
+                        pos = copy.deepcopy(self.home_pos) + pos_noise
+                        # print("val")
+                        # print(pos_noise)
+                        # print(new_quat,quat)
+                        gotoPose(pos,new_quat)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
@@ -81,6 +104,12 @@ class DataLogger:
         rospy.loginfo(f"[data_logger] Recording {state}")
         if not self.recording:
             self._save_episode()
+            # autohome
+            rand_rot = ScipyR.from_rotvec(np.random.normal(0,0.015,3))
+            new_quat = (self.home_quat_R*rand_rot).as_quat()
+            pos_noise = np.random.normal(0,0.003,3)
+            pos = copy.deepcopy(self.home_pos) + pos_noise
+            gotoPose(pos,new_quat)
 
     def _save_episode(self):
         N = len(self.states)
@@ -96,7 +125,7 @@ class DataLogger:
         imgs_arr    = np.stack(self.images[:-1], axis=0)  # (N−1, H, W, 3)
 
         timestamp = rospy.Time.now().to_nsec()
-        fname = f"episode_{timestamp}.pkl"
+        fname = f"../../data/tapping_from_homed_6-30_{timestamp}.pkl"
         with open(fname, 'wb') as f:
             pickle.dump((states_arr, actions_arr, imgs_arr), f)
         rospy.loginfo(f"[data_logger] Saved episode: {fname}")

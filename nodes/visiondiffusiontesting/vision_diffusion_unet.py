@@ -29,58 +29,50 @@ from vision_encoding import getVisionModel
 
 class TrajectoryDatasetDiffusion(Dataset):
     def __init__(self, model, states, actions, images, pred_horizon, obs_horizon, action_horizon, distort=False):
-        # LLMVISIONUPDATE: using precomputed image features
+        # LLMVISIONUPDATE: remove precompute_feats logic, store raw images for on-the-fly encoding
         num_episodes = len(states)
         obs_dim = np.shape(states[0])[0]
         action_dim = np.shape(actions[0])[0]
 
-        if distort:
-            print("Creating new dataset with image distortions")
+        self.distort = distort
+        self.vision_model = model
+        self.raw_images = images
 
-        # Process visual features
-        image_feats = []
-        for image_ep in images:
-            image_feats.append(model.precompute_feats(image_ep,distort=distort))
-
-        feat_dim = np.shape(image_feats[0])[1]  # assume (T_i, feat_dim)
-
-        self.num_samples = 0 
+        # flatten state/action sequences
+        self.num_samples = 0
         self.states_flat = np.zeros((0, obs_dim))
         self.actions_flat = np.zeros((0, action_dim))
-        self.image_feats_flat = np.zeros((0, feat_dim))
+        self.episode_actions = [] # need to have episode data for computing diffs (otherwise, the diff is large at the end of an episode)
         self.ends = []
+
+        if distort:
+            print("Augmenting Data for ",model.__class__.__name__)
 
         for ii in range(num_episodes):
             T_i = np.shape(states[ii])[1]
             self.num_samples += T_i
             self.states_flat = np.concatenate((self.states_flat, states[ii].T), axis=0)
             self.actions_flat = np.concatenate((self.actions_flat, actions[ii].T), axis=0)
-            self.image_feats_flat = np.concatenate((self.image_feats_flat, image_feats[ii]), axis=0)
+            self.episode_actions.append(actions[ii].T)
             self.ends.append(self.num_samples)
 
-        train_data = {
+        # TODO: might need to repeat last action for stability (otherwise it can choose super random actions at the end when it becomes OOD). Consider this....
+
+        self.train_data = {
             'action': self.actions_flat,
             'obs': self.states_flat
         }
-
         episode_ends = np.array(self.ends)
 
-        indices = create_sample_indices(
+        self.indices = create_sample_indices(
             episode_ends=episode_ends,
             sequence_length=pred_horizon,
             pad_before=obs_horizon-1,
             pad_after=action_horizon-1)
 
-        stats = {}
-        normalized_train_data = {}
-        for key, data in train_data.items():
-            stats[key] = get_data_stats(data)
-            normalized_train_data[key] = normalize_data(data, stats[key])
-
-        self.indices = indices
-        self.stats = stats
-        self.normalized_train_data = normalized_train_data
-        self.image_feats_flat = torch.from_numpy(self.image_feats_flat).float()
+        self.stats = {key: get_data_stats(data, key, pred_horizon, self.episode_actions) for key, data in self.train_data.items()}
+        # self.normalized_train_data = {key: normalize_data(data, self.stats[key])
+        #                               for key, data in self.train_data.items()}
         self.pred_horizon = pred_horizon
         self.action_horizon = action_horizon
         self.obs_horizon = obs_horizon
@@ -89,42 +81,44 @@ class TrajectoryDatasetDiffusion(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = self.indices[idx]
-
-        nsample = sample_sequence(
-            train_data=self.normalized_train_data,
+        buffer_start, buffer_end, sample_start, sample_end = self.indices[idx]
+        # Sample from unnormalized data
+        raw_sample = sample_sequence(
+            train_data=self.train_data,  # <- unnormalized data
             sequence_length=self.pred_horizon,
-            buffer_start_idx=buffer_start_idx,
-            buffer_end_idx=buffer_end_idx,
-            sample_start_idx=sample_start_idx,
-            sample_end_idx=sample_end_idx
+            buffer_start_idx=buffer_start,
+            buffer_end_idx=buffer_end,
+            sample_start_idx=sample_start,
+            sample_end_idx=sample_end
         )
-        nsample['obs'] = nsample['obs'][:self.obs_horizon, :]
 
+        raw_sample['obs'] = raw_sample['obs'][:self.obs_horizon, :]
 
-        ######
-        # All actions are relative from the current state
-
-        action = nsample['action']  # (T, D)
+        # Apply relative transformation on raw action
+        action = raw_sample['action']
         pos_dim = action.shape[1] - 4
         pos = action[:, :pos_dim]
-        quat = action[:, pos_dim:]  # [x, y, z, w]
-
-        # Compute relative position
+        quat = action[:, pos_dim:]
         pos0 = pos[0]
         pos_rel = pos - pos0
-
-        # Compute relative quaternion: q_rel = q * q0.inv()
         r_all = R.from_quat(quat)
         r0 = r_all[0]
         quat_rel = (r_all * r0.inv()).as_quat()
+        action_rel = np.concatenate([pos_rel, quat_rel], axis=1)
 
-        nsample['action'] = np.concatenate([pos_rel, quat_rel], axis=1)
+        # Normalize the relative action
+        nsample = {
+            'obs': normalize_data(raw_sample['obs'], self.stats['obs']),
+            'action': normalize_data(action_rel, self.stats['action']),
+        }
 
-        # LLMVISIONUPDATE: use precomputed image feature at obs_horizon-1
-        feats_window = self.image_feats_flat[buffer_start_idx:buffer_end_idx]
-        nsample['image_feat'] = feats_window[self.obs_horizon - 1].float()
-
+        # Return raw image for on-the-fly encoding in model
+        index = buffer_start + (self.obs_horizon - 1)
+        ep_idx = np.searchsorted(self.ends, index, side='right')
+        local_idx = index - (self.ends[ep_idx-1] if ep_idx>0 else 0)
+        img = self.raw_images[ep_idx][local_idx]
+        imgs_tensor = self.vision_model.transform([img], distort=self.distort).squeeze(0)
+        nsample['image'] = imgs_tensor  # numpy array (H,W,3)
         return nsample
 
 
@@ -176,24 +170,101 @@ def create_sample_indices(
     indices = np.array(indices)
     return indices
 
-def get_data_stats(data):
-    data = data.reshape(-1,data.shape[-1])
-    stats = {
-        'min': np.min(data, axis=0),
-        'max': np.max(data, axis=0)
-    }
+# def get_data_stats(data,key,action_horizon):
+#     data = data.reshape(-1,data.shape[-1])
+#     if key=='action':
+#         # action ends up relative -- need to do different normalization -- this is a bit conservative for now (but spatially consistent)
+#         stats = {
+#             'min': -action_horizon*np.max(np.abs(np.diff(data,axis=0)), axis=0),
+#             'max': action_horizon*np.max(np.abs(np.diff(data,axis=0)), axis=0)
+#         }
+
+#         # Replace last 4 entries (quaternion dimensions) TODO: need better representation
+#         custom_min = np.array([-1, -1, -1, -1])  
+#         custom_max = np.array([1, 1, 1, 1])
+
+#         stats['min'][-4:] = custom_min
+#         stats['max'][-4:] = custom_max
+#     else:
+#         stats = {
+#             'min': np.min(data, axis=0),
+#             'max': np.max(data, axis=0)
+#         }
+#     return stats
+
+# def normalize_data(data, stats):
+#     # nomalize to [0,1]
+#     ndata = (data - stats['min']) / (stats['max'] - stats['min'])
+#     # normalize to [-1, 1]
+#     ndata = ndata * 2 - 1
+#     return ndata
+
+# def unnormalize_data(ndata, stats):
+#     ndata = (ndata + 1) / 2
+#     data = ndata * (stats['max'] - stats['min']) + stats['min']
+#     return data
+
+def get_data_stats(data, key, pred_horizon, episode_actions):
+    """
+    data: shape (N*T, D) flattened sequence
+    returns stats['min'], stats['max']: shape (T, D) for actions [variable normalization] or shape (D) otherwise
+    """
+    if key == 'action':
+        max_abs_diff_per_episode = []
+        for episode_actions_tmp in episode_actions:
+            max_abs_diff_per_episode.append(np.max(np.abs(np.diff(episode_actions_tmp,axis=0)), axis=0)) # shape (D,))
+        max_abs_diff_per_episode = np.array(max_abs_diff_per_episode)
+        max_abs_diff = np.max(max_abs_diff_per_episode, axis=0)
+
+        # Per-time-step scaling
+        min_bounds = []
+        max_bounds = []
+        for t in range(pred_horizon):
+            scale = (t + 1)
+            min_t = -scale * max_abs_diff
+            max_t = scale * max_abs_diff
+
+            # Override quaternion bounds (last 4 dims)
+            min_t[-4:] = np.array([-1, -1, -1, -1])
+            max_t[-4:] = np.array([1, 1, 1, 1])
+
+            min_bounds.append(min_t)
+            max_bounds.append(max_t)
+
+        stats = {
+            'min': np.stack(min_bounds, axis=0),  # shape (T, D)
+            'max': np.stack(max_bounds, axis=0)
+        }
+    else:
+        data = data.reshape(-1, data.shape[-1])
+        stats = {
+            'min': np.min(data, axis=0),
+            'max': np.max(data, axis=0)
+        }
     return stats
 
 def normalize_data(data, stats):
-    # nomalize to [0,1]
-    ndata = (data - stats['min']) / (stats['max'] - stats['min'])
-    # normalize to [-1, 1]
-    ndata = ndata * 2 - 1
+    """
+    data: shape (N, T, D)
+    stats['min'], stats['max']: shape (T, D) or (D,)
+    """
+    if data.ndim == 2 and stats['min'].ndim == 2:
+        ndata = (data - stats['min'][None, :, :]) / (stats['max'][None, :, :] - stats['min'][None, :, :])
+        ndata = ndata * 2 - 1
+        ndata = ndata.squeeze()
+    else:
+        ndata = (data - stats['min']) / (stats['max'] - stats['min'])
+        ndata = ndata * 2 - 1
     return ndata
 
 def unnormalize_data(ndata, stats):
-    ndata = (ndata + 1) / 2
-    data = ndata * (stats['max'] - stats['min']) + stats['min']
+    if ndata.ndim == 2 and stats['min'].ndim == 2:
+        data = (ndata + 1) / 2
+        data = data * (stats['max'][None, :, :] - stats['min'][None, :, :]) + stats['min'][None, :, :]
+        data = data.squeeze()
+    else:
+        data = (ndata + 1) / 2
+        data = data * (stats['max'] - stats['min']) + stats['min']
     return data
 
 ######### Diffusion Model (u-net) Related ############
@@ -437,21 +508,78 @@ class ConditionalUnet1D(nn.Module):
         return x
     
 
+######### Vision conditioned U-Net Related ####################
+
+class VisionConditionedUNet(nn.Module):
+    def __init__(self, 
+                 input_dim,
+                 global_cond_dim,
+                 vision_encoder_model_name='none',
+                 freeze_encoder=False,
+                 device='cuda'):
+        super().__init__()
+
+        self.device = device
+
+        self.encoder = getVisionModel(modelname=vision_encoder_model_name)
+        
+        # add feature dim from visual encoder to unet total conditioning
+        dummy_img = torch.zeros((1, 3, 224, 224)).to(self.device)
+        feat_dim = self.encoder.getModel()(dummy_img).shape[-1]
+        global_cond_dim += feat_dim
+
+        self.unet = ConditionalUnet1D(input_dim, global_cond_dim)
+
+        self.freeze_encoder = freeze_encoder
+        self.device = device
+
+    def forward(self, x: torch.Tensor, 
+                      timesteps: torch.Tensor, 
+                      images_np: np.ndarray = None,
+                      global_cond: torch.Tensor = None,
+                      distort: bool = False):
+        """
+        x: input trajectory (B, ...)
+        timesteps: diffusion timestep tensor (B,)
+        images_np: (B, H, W, 3) numpy array of images
+        global_cond: (B, cond_dim) additional conditioning input
+        """
+
+        # Encode vision features using self.encoder
+        if isinstance(images_np, torch.Tensor):
+            imgs = images_np.to(self.device)
+            if self.freeze_encoder:
+                with torch.no_grad():
+                    feats = self.encoder.getModel()(imgs)
+            else:
+                feats = self.encoder.getModel()(imgs)
+            image_features = feats
+        else:
+            feats = self.encoder.encode(images_np, device=self.device, distort=distort)
+            image_features = feats.to(self.device).float()
+
+        # Concatenate image features to existing condition if provided
+        if global_cond is not None:
+            cond = torch.cat([global_cond.to(self.device), image_features], dim=-1).float()
+        else:
+            cond = image_features # TODO: this makes no sense as a fallback
+
+        return self.unet(x, timesteps, global_cond=cond)
+    
+######################################################################
 
 class VisionDiffusionUNet(Policy):
-    def __init__(self, params):
+    def __init__(self, params=None):
         
-        self.vision_model_name = params.vision_model_name
-        self.num_epochs = params.num_epochs
-        self.obs_horizon = params.obs_horizon
-        self.pred_horizon = params.pred_horizon
-        self.action_horizon = params.action_horizon
-        self.diffusion_iterations = params.diffusion_iterations
+        if params is not None:
+            self.vision_model_name = params['vision_model_name']
+            self.num_epochs = params['num_epochs']
+            self.obs_horizon = params['obs_horizon']
+            self.pred_horizon = params['pred_horizon']
+            self.action_horizon = params['action_horizon']
+            self.diffusion_iterations = params['diffusion_iterations']
 
         self.device = torch.device('cuda')
-
-        self.vision_model = getVisionModel(modelname = self.vision_model_name)
-        self.vision_model.to(self.device).eval()
 
         self.lr_scheduler = None
 
@@ -461,8 +589,9 @@ class VisionDiffusionUNet(Policy):
 
         super().__init__()
 
-    def setupData(self, states, actions, images, distort=False):
+    def setupData(self, states, actions, images, noise_pred_net, distort=False):
         dataset = TrajectoryDatasetDiffusion(
+            model = noise_pred_net.encoder,
             states=states,
             actions=actions,
             images=images,
@@ -473,29 +602,27 @@ class VisionDiffusionUNet(Policy):
         )
         dataloader = DataLoader(
             dataset,
-            batch_size=256,
-            num_workers=1,
+            batch_size=64,
+            num_workers=4,
             shuffle=True,
             pin_memory=True,
             persistent_workers=True
         )
         return dataset, dataloader
 
-    def train(self, states, actions, images, savelocation, save_epoch_freq=None ,distort=False):
+    def train(self, states, actions, images, savelocation, save_epoch_freq=None ,distort=False, freeze_encoder=True):
     
         obs_dim = np.shape(states[0])[0]
         action_dim = np.shape(actions[0])[0]
 
-        # LLMVISIONUPDATE: determine image feature dimension
-        dummy_img = torch.zeros((1, 3, 224, 224)).to(self.device)
-        feat_dim = self.vision_model.model(dummy_img).shape[-1]
+        # Without visual features
+        total_cond_dim = obs_dim * self.obs_horizon 
 
-        # LLMVISIONUPDATE: include image features in global conditioning dimension
-        total_cond_dim = obs_dim * self.obs_horizon + feat_dim
-
-        noise_pred_net = ConditionalUnet1D(
+        noise_pred_net = VisionConditionedUNet(
             input_dim=action_dim,
-            global_cond_dim=total_cond_dim
+            global_cond_dim=total_cond_dim,
+            vision_encoder_model_name = self.vision_model_name,
+            freeze_encoder=freeze_encoder
         )
 
         noise_scheduler = DDIMScheduler(
@@ -515,16 +642,15 @@ class VisionDiffusionUNet(Policy):
         ema = EMAModel(parameters=noise_pred_net.parameters(), power=0.75)
         optimizer = torch.optim.AdamW(noise_pred_net.parameters(), lr=1e-4, weight_decay=1e-6)
         
-        if not distort: # load data and set up scheduler once
-            dataset, dataloader = self.setupData(states, actions, images)
+        dataset, dataloader = self.setupData(states, actions, images, noise_pred_net, distort=distort)
 
-            # Cosine LR schedule with linear warmup
-            self.lr_scheduler = get_scheduler(
-                name='cosine',
-                optimizer=optimizer,
-                num_warmup_steps=500,
-                num_training_steps=len(dataloader) * self.num_epochs
-            )
+        # Cosine LR schedule with linear warmup
+        self.lr_scheduler = get_scheduler(
+            name='cosine',
+            optimizer=optimizer,
+            num_warmup_steps=500,
+            num_training_steps=len(dataloader) * self.num_epochs
+        )
 
         # store diffusion_params including new feature dim
         all_actions = np.concatenate(actions, axis=1)  # list of (m, T_i) → (m, T_total)
@@ -538,7 +664,6 @@ class VisionDiffusionUNet(Policy):
             'pred_horizon': self.pred_horizon,
             'action_horizon': self.action_horizon,
             'diffusion_iterations': self.diffusion_iterations,
-            'image_feat_dim': feat_dim,
             'vision_model_name': self.vision_model_name,
             'action_mins': self.action_mins,
             'action_maxs': self.action_maxs 
@@ -548,32 +673,38 @@ class VisionDiffusionUNet(Policy):
         for epoch_idx in range(self.num_epochs):
             epoch_loss = []
             epoch_startt=time.time()
-            if distort:
-                dataset, dataloader = self.setupData(states, actions, images,distort=True)
-                # Cosine LR schedule with linear warmup
-                if self.lr_scheduler is None:
-                    self.lr_scheduler = get_scheduler(
-                        name='cosine',
-                        optimizer=optimizer,
-                        num_warmup_steps=500,
-                        num_training_steps=len(dataloader) * self.num_epochs
-                    )
+            # if distort:
+            #     # clean up
+            #     if 'dataloader' in locals():
+            #         del dataloader
+            #     if 'dataset' in locals():
+            #         del dataset
+            #     torch.cuda.empty_cache()  # optional, helpful for long runs
+            #     dataset, dataloader = self.setupData(states, actions, images,distort=True)
+            #     # Cosine LR schedule with linear warmup
+            #     if self.lr_scheduler is None:
+            #         self.lr_scheduler = get_scheduler(
+            #             name='cosine',
+            #             optimizer=optimizer,
+            #             num_warmup_steps=500,
+            #             num_training_steps=len(dataloader) * self.num_epochs
+            #         )
             for nbatch in dataloader:
                 nobs = nbatch['obs'].to(device).float()
                 naction = nbatch['action'].to(device).float()
                 # LLMVISIONUPDATE: get image feature batch
-                img_feat = nbatch['image_feat'].to(device).float()
+                img_tensor = nbatch['image'].to(device).float()
 
                 B = nobs.shape[0]
                 obs_cond = nobs[:, :self.obs_horizon, :].flatten(start_dim=1)
                 # LLMVISIONUPDATE: concatenate image features to conditioning
-                obs_cond = torch.cat([obs_cond, img_feat], dim=1)
+                # obs_cond = torch.cat([obs_cond, img_feat], dim=1)
 
                 noise = torch.randn(naction.shape, device=device)
                 timesteps = torch.randint(0, self.diffusion_iterations, (B,), device=device)
 
                 noisy_actions = noise_scheduler.add_noise(naction, noise, timesteps)
-                noise_pred = noise_pred_net(noisy_actions, timesteps, global_cond=obs_cond)
+                noise_pred = noise_pred_net(noisy_actions, timesteps, images_np=img_tensor, global_cond=obs_cond)
                 loss = nn.functional.mse_loss(noise_pred, noise)
 
                 optimizer.zero_grad()
@@ -629,16 +760,17 @@ class VisionDiffusionUNet(Policy):
         self.pred_horizon = self.diffusion_params["pred_horizon"]
         self.action_horizon = self.diffusion_params["action_horizon"]
         self.diffusion_iterations = self.diffusion_params["diffusion_iterations"]
-        self.feat_dim = self.diffusion_params['image_feat_dim']
+        self.vision_model_name = self.diffusion_params['vision_model_name']
 
         self.action_mins = self.diffusion_params["action_mins"]
         self.action_maxs = self.diffusion_params["action_maxs"]
 
         self.device = torch.device('cuda')
         
-        self.noise_pred_net = ConditionalUnet1D(
+        self.noise_pred_net = VisionConditionedUNet(
             input_dim=self.action_dim,
-            global_cond_dim=self.obs_dim*self.obs_horizon + self.feat_dim
+            global_cond_dim=self.obs_dim*self.obs_horizon,
+            vision_encoder_model_name=self.vision_model_name
             )
 
         self.noise_pred_net.load_state_dict(torch.load(location, map_location='cpu'))
@@ -676,16 +808,11 @@ class VisionDiffusionUNet(Policy):
 
         # LLMVISIONUPDATE: process latest image through DINOv2 for conditioning
         raw_img = self.image_deque[-1]
-
-        img_feat = self.vision_model.encode([raw_img],1,self.device)
     
-        print(np.shape(img_feat))
-        obs_cond = obs_cond.float()  # Ensure float32
-        obs_cond = torch.cat([obs_cond, torch.from_numpy(img_feat).float().to(self.device)], dim=1)
-
         noisy_action = torch.randn((1, self.pred_horizon, self.action_dim), device=self.device)
         for k in self.noise_scheduler.timesteps:
-            noise_pred = self.noise_pred_net(noisy_action, k, global_cond=obs_cond)
+            # noise_pred = self.noise_pred_net(noisy_action, k, global_cond=obs_cond)
+            noise_pred = self.noise_pred_net(noisy_action, k, images_np=[raw_img], global_cond=obs_cond)
             noisy_action = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=noisy_action).prev_sample
 
         naction = noisy_action.cpu().detach().numpy()[0]
@@ -695,13 +822,20 @@ class VisionDiffusionUNet(Policy):
         pos_rel = action_rel[:, :pos_dim]
         quat_rel = action_rel[:, pos_dim:]
 
+        print(state)
+        print(np.shape(action_rel))
+        print(np.round(action_rel,2)[0,:])
+
         # Recover absolute positions
-        pos_abs = np.cumsum(pos_rel, axis=0)
+        pos_abs = pos_rel + state[0:3]
 
         # Recover absolute quaternions via composition: q = q_rel · q₀
         q0 = R.from_quat(state[3:7])
         q_rel_seq = R.from_quat(quat_rel)
         quat_abs = (q_rel_seq * q0).as_quat()
+
+        # TODO: is quaternion the best representation...  need to at least normalize but also look at the diff-dagger which has a citation
+        # for a specific orientation representation
 
         generated = np.concatenate([pos_abs, quat_abs], axis=1)
 
@@ -715,55 +849,51 @@ class VisionDiffusionUNet(Policy):
             """
             return self.sampleActions(state, image, num_seeds, length)
 
-    def sampleActions(self, state, image, num_samples, length):
-        """
-        Sample `num_samples` independent action sequences of given `length`.
-        """
-        if self.obs_deque is None:
-            self.obs_deque = collections.deque([state] * self.obs_horizon, maxlen=self.obs_horizon)
-            self.image_deque = collections.deque([image] * self.obs_horizon, maxlen=self.obs_horizon)
-            self.noise_scheduler.set_timesteps(self.diffusion_iterations)
-        self.obs_deque.append(state)
-        self.image_deque.append(image)
+    # def sampleActions(self, state, image, num_samples, length):
+    #     """
+    #     Sample num_samples independent action sequences of given length.
+    #     """
+    #     if self.obs_deque is None:
+    #         self.obs_deque = collections.deque([state] * self.obs_horizon, maxlen=self.obs_horizon)
+    #         self.image_deque = collections.deque([image] * self.obs_horizon, maxlen=self.obs_horizon)
+    #         self.noise_scheduler.set_timesteps(self.diffusion_iterations)
+    #     self.obs_deque.append(state)
+    #     self.image_deque.append(image)
 
-        obs_seq = np.stack(self.obs_deque)
-        nobs = normalize_data(obs_seq, stats=self.dataset.stats['obs'])
-        nobs = torch.from_numpy(nobs).to(self.device, dtype=torch.float32)
-        obs_cond = nobs.unsqueeze(0).flatten(start_dim=1)
+    #     obs_seq = np.stack(self.obs_deque)
+    #     nobs = normalize_data(obs_seq, stats=self.dataset.stats['obs'])
+    #     nobs = torch.from_numpy(nobs).to(self.device, dtype=torch.float32)
+    #     obs_cond = nobs.unsqueeze(0).flatten(start_dim=1)
 
-        raw_img = self.image_deque[-1]
-        img_feat = self.vision_model.encode([raw_img],1,self.device)
-        img_feat = torch.from_numpy(img_feat).float().to(self.device).squeeze(0)
+    #     raw_img = self.image_deque[-1]
 
-        # replicate conditioning for batch
-        cond_state = obs_cond.repeat(num_samples, 1)
-        cond_img = img_feat.unsqueeze(0).repeat(num_samples, 1)
-        global_cond = torch.cat([cond_state, cond_img], dim=1)
+    #     # replicate conditioning for batch
+    #     cond_state = obs_cond.repeat(num_samples, 1)
 
-        noisy_actions = torch.randn((num_samples, self.pred_horizon, self.action_dim), device=self.device)
-        for k in self.noise_scheduler.timesteps:
-            noise_pred = self.noise_pred_net(noisy_actions, k, global_cond=global_cond)
-            noisy_actions = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=noisy_actions).prev_sample
+    #     noisy_actions = torch.randn((num_samples, self.pred_horizon, self.action_dim), device=self.device)
+    #     for k in self.noise_scheduler.timesteps:
+    #         noise_pred = self.noise_pred_net(noisy_actions, k, images_np=raw_img, global_cond=cond_state)
+    #         noisy_actions = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=noisy_actions).prev_sample
 
-        naction = noisy_actions.cpu().numpy()
-        action_rel = unnormalize_data(naction, stats=self.dataset.stats['action'])
+    #     naction = noisy_actions.cpu().numpy()
+    #     action_rel = unnormalize_data(naction, stats=self.dataset.stats['action'])
 
-        pos_dim = action_rel.shape[2] - 4
-        pos_rel = action_rel[:, :, :pos_dim]
-        quat_rel = action_rel[:, :, pos_dim:]
+    #     pos_dim = action_rel.shape[2] - 4
+    #     pos_rel = action_rel[:, :, :pos_dim]
+    #     quat_rel = action_rel[:, :, pos_dim:]
 
-        # Recover positions
-        pos_abs = np.cumsum(pos_rel, axis=1)
+    #     # Recover positions
+    #     pos_abs = np.cumsum(pos_rel, axis=1)
 
-        # Recover quaternions
-        q0 = R.from_quat(state[3:7]) # pos, orientation are the start of state
-        quat_abs = np.stack([(R.from_quat(qrel) * q0).as_quat() for qrel in quat_rel], axis=0)
+    #     # Recover quaternions
+    #     q0 = R.from_quat(state[3:7]) # pos, orientation are the start of state
+    #     quat_abs = np.stack([(R.from_quat(qrel) * q0).as_quat() for qrel in quat_rel], axis=0)
 
-        generated = np.concatenate([pos_abs, quat_abs], axis=2)
+    #     generated = np.concatenate([pos_abs, quat_abs], axis=2)
 
-        if length < generated.shape[1]:
-            return generated[:, :length, :]
-        return generated
+    #     if length < generated.shape[1]:
+    #         return generated[:, :length, :]
+    #     return generated
 
     def reset(self):
         self.obs_deque = None

@@ -12,6 +12,7 @@ from PIL import Image
 import torchvision.transforms as T
 import torchvision
 import torch.nn as nn
+import torch.nn.functional as F
 
 # dinov2
 from transformers import AutoModel, AutoImageProcessor
@@ -21,24 +22,46 @@ from transformers import AutoModel, AutoImageProcessor
 # Don't process images -- becomes state-based #
 ###############################################
 
+class DummyVisionEncoder(nn.Module):
+    def forward(self, images):
+        B = images.shape[0]
+        device = images.device
+        return torch.empty((B, 0), device=device)
+
+
 class NoImages:
     def __init__(self, device = 'cuda') -> None:
-        self.model = None
+        self.model = DummyVisionEncoder()
         self.device = device
 
-    def encode(self, images_arr, batch_size, distort = False):
-        return np.zeros((len(images_arr),0)) # shape (T, feat_dim = 0)
+    def getModel(self):
+        return self.model
 
-    def precompute_feats(self, images_arr: np.ndarray,
-                            batch_size=32,
-                            distort = False):
-        """
-        images_arr: np.ndarray of shape (T, H, W, 3)
-        Returns: np.ndarray of shape (T, feat_dim)
-        """
-        assert images_arr.ndim == 4 and images_arr.shape[-1] == 3, "Expected (T, H, W, 3) array"
+    def transform(self, images_arr, distort=False):
+    
+        # just do imagenet transforms -- though encoder will throw away images
+        transform = T.Compose([
+            T.Resize((224, 224)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std =[0.229, 0.224, 0.225])
+        ])
 
-        return self.encode(images_arr, batch_size, distort=False)
+        # Preprocess all images
+        tensors = [
+            transform(Image.fromarray(img).convert("RGB"))
+            for img in images_arr
+        ]
+        imgs_tensor = torch.stack(tensors, dim=0)  # (T, 3, 224, 224)
+
+        return imgs_tensor
+
+    def encode(self, images_arr, batch_size=None, device=None, distort=False):
+        imgs_tensor = self.transform(images_arr, distort=distort).to(self.device)
+        with torch.no_grad():
+            output = self.model(imgs_tensor)
+        return output  # shape (B, feat_dim)
+
 
 
 ###############################################
@@ -98,27 +121,63 @@ def replace_submodules(
     return root_module
 
 
+class SpatialSoftmax(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        # infer the feature and channel size
+        N, C, H, W = x.shape
+        pos_x, pos_y = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, W, device=x.device),
+            torch.linspace(-1.0, 1.0, H, device=x.device),
+            indexing='xy'
+        )
+        pos_x = pos_x.reshape(H * W)
+        pos_y = pos_y.reshape(H * W)
+
+        x = x.view(N, C, H * W)
+        softmax = F.softmax(x, dim=2)
+
+        expected_x = torch.sum(pos_x * softmax, dim=2)
+        expected_y = torch.sum(pos_y * softmax, dim=2)
+        return torch.cat([expected_x, expected_y], dim=1)
+
+
 class ResNet:
     def __init__(self, device = 'cuda') -> None:
-        self.model = self.get_resnet('resnet18', weights="IMAGENET1K_V1")
         self.device = device
         self.use_groupnorm = True
+        self.model = self.get_resnet('resnet18', weights="IMAGENET1K_V1").to(device)
 
-    def get_resnet(self, name:str, weights=None, **kwargs) -> nn.Module:
-        """
-        name: resnet18, resnet34, resnet50
-        weights: "IMAGENET1K_V1", None
-        """
-        # Use standard ResNet implementation from torchvision
+    def get_resnet(self, name: str, weights=None, **kwargs) -> nn.Module:
         func = getattr(torchvision.models, name)
         resnet = func(weights=weights, **kwargs)
 
-        # remove the final fully connected layer
-        # for resnet18, the output dim should be 512
-        resnet.fc = torch.nn.Identity()
-        return resnet
+        # TODO: check this vs original paper or robomimic implementation
 
-    def encode(self, images_arr, batch_size, distort=False):
+        # Remove avgpool and fc layers
+        modules = list(resnet.children())[:-2]  # keep up to layer4
+        self.feature_extractor = nn.Sequential(*modules)
+
+        # Add spatial softmax in place of global avgpool
+        self.spatial_softmax = SpatialSoftmax()
+
+        # Compose into a final model
+        model = nn.Sequential(
+            self.feature_extractor,
+            self.spatial_softmax
+        )
+
+        if self.use_groupnorm:
+            model = replace_bn_with_gn(model)
+
+        return model
+    
+    def getModel(self):
+        return self.model
+    
+    def transform(self, images_arr, distort=False):
         if not distort:
             # just do imagenet transforms
             transform = T.Compose([
@@ -132,8 +191,8 @@ class ResNet:
             transform = T.Compose([
                 T.Resize((240, 240)),
                 T.RandomCrop((224, 224)),
-                T.ColorJitter(brightness=0.1, contrast=0.1),
-                T.GaussianBlur(kernel_size=3),
+                T.ColorJitter(brightness=0.3, contrast=0.3),
+                T.GaussianBlur(kernel_size=9,sigma=(0.1, 2.0)),
                 T.ToTensor(),
                 T.Normalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225]),
@@ -147,39 +206,24 @@ class ResNet:
         ]
         imgs_tensor = torch.stack(tensors, dim=0)  # (T, 3, 224, 224)
 
-        feats = []
+        return imgs_tensor
+
+    def encode(self, images_arr, batch_size=None, device=None, distort=False):
+        imgs_tensor = self.transform(images_arr, distort=distort).to(self.device)
         with torch.no_grad():
-            for i in range(0, imgs_tensor.shape[0], batch_size):
-                batch = imgs_tensor[i:i+batch_size].to(self.device)
-                output = self.model(batch).cpu()
-                feats.append(output)
+            output = self.model(imgs_tensor)
+        return output  # shape (B, feat_dim)
 
-        return torch.cat(feats, dim=0).numpy()  # shape (T, feat_dim)
-
-    def precompute_feats(self,
-                         images_arr: np.ndarray,
-                         batch_size=32,
-                         distort = False):
-        """
-        images_arr: np.ndarray of shape (T, H, W, 3)
-        Returns: np.ndarray of shape (T, feat_dim)
-        """
-        assert images_arr.ndim == 4 and images_arr.shape[-1] == 3, "Expected (T, H, W, 3) array"
-
-
-        if self.use_groupnorm:
-            replace_bn_with_gn(self.model)
-
-        self.model.to(self.device).eval()
-
-        return self.encode(images_arr, batch_size, distort=distort)
 
 class DinoV2:
     def __init__(self, device = 'cuda') -> None:
-        self.model = AutoModel.from_pretrained("facebook/dinov2-base")
+        self.model = AutoModel.from_pretrained("facebook/dinov2-base").to(device)
         self.device = device
+    
+    def getModel(self):
+        return self.model
 
-    def encode(self, images_arr,batch_size, distort=False):
+    def transform(self, images_arr, distort=False):
         if not distort:
             # just do imagenet transforms
             transform = T.Compose([
@@ -208,28 +252,13 @@ class DinoV2:
         ]
         imgs_tensor = torch.stack(tensors, dim=0)  # (T, 3, 224, 224)
 
-        feats = []
+        return imgs_tensor
+
+    def encode(self, images_arr, batch_size=None, device=None, distort=False):
+        imgs_tensor = self.transform(images_arr, distort=distort).to(self.device)
         with torch.no_grad():
-            for i in range(0, imgs_tensor.shape[0], batch_size):
-                batch = imgs_tensor[i:i+batch_size].to(self.device)
-                output = self.model(batch).cpu()
-                feats.append(output)
-
-        return torch.cat(feats, dim=0).numpy()  # shape (T, feat_dim)
-
-    def precompute_feats(self,
-                         images_arr: np.ndarray,
-                         batch_size=32,
-                         distort = False):
-        """
-        images_arr: np.ndarray of shape (T, H, W, 3)
-        Returns: np.ndarray of shape (T, feat_dim)
-        """
-        assert images_arr.ndim == 4 and images_arr.shape[-1] == 3, "Expected (T, H, W, 3) array"
-
-        self.model.to(self.device).eval()
-
-        return self.encode(images_arr, batch_size, distort=distort)
+            output = self.model(imgs_tensor)
+        return output  # shape (B, feat_dim)
 
 
 def getVisionModel(modelname='none'):

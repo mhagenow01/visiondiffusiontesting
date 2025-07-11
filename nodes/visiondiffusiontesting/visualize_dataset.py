@@ -78,7 +78,7 @@ def plot_3d_trajectories(trajs):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pattern', type=str, default='tapping*.pkl',
+    parser.add_argument('--pattern', type=str, default='./../../data_downsampled/tapping*.pkl',
                         help='Glob pattern for input .pkl files (default: "episode_*.pkl")')
     args = parser.parse_args()
 
